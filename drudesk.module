@@ -1,0 +1,245 @@
+<?php
+/**
+ * @file
+ * Main DruDesk module.
+ */
+
+/**
+ * Implements hook_menu().
+ */
+function drudesk_menu() {
+  $items = array();
+  $items['favorites/check'] = array(
+    'page callback' => '_drudesk_favorites',
+    'access callback' => TRUE,
+    'type' => MENU_CALLBACK,
+  );
+  $items['ddentityreference/autocomplete/tags/%/%/%'] = array(
+    'title' => 'Entity Reference Autocomplete',
+    'page callback' => '_drudesk_entityreference_autocomplete_callback',
+    'page arguments' => array(2, 3, 4, 5),
+    'access callback' => 'entityreference_autocomplete_access_callback',
+    'access arguments' => array(2, 3, 4, 5),
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+/**
+ * Menu callback: autocomplete the label of an entity.
+ *
+ * @param $type
+ *   The widget type (i.e. 'single' or 'tags').
+ * @param $field_name
+ *   The name of the entity-reference field.
+ * @param $entity_type
+ *   The entity type.
+ * @param $bundle_name
+ *   The bundle name.
+ * @param $entity_id
+ *   Optional; The entity ID the entity-reference field is attached to.
+ *   Defaults to ''.
+ * @param $string
+ *   The label of the entity to query by.
+ */
+function _drudesk_entityreference_autocomplete_callback($type, $field_name, $entity_type, $bundle_name, $entity_id = '', $string = '') {
+  // If the request has a '/' in the search text, then the menu system will have
+  // split it into multiple arguments and $string will only be a partial. We want
+  //  to make sure we recover the intended $string.
+  $args = func_get_args();
+  // Shift off the $type, $field_name, $entity_type, $bundle_name, and $entity_id args.
+  array_shift($args);
+  array_shift($args);
+  array_shift($args);
+  array_shift($args);
+  array_shift($args);
+  $string = implode('/', $args);
+
+  $field = field_info_field($field_name);
+  $instance = field_info_instance($entity_type, $field_name, $bundle_name);
+
+  return _drudesk_entityreference_autocomplete_callback_get_matches($type, $field, $instance, $entity_type, $entity_id, $string);
+}
+
+/**
+ * Return JSON based on given field, instance and string.
+ *
+ * This function can be used by other modules that wish to pass a mocked
+ * definition of the field on instance.
+ *
+ * @param $type
+ *   The widget type (i.e. 'single' or 'tags').
+ * @param $field
+ *   The field array defintion.
+ * @param $instance
+ *   The instance array defintion.
+ * @param $entity_type
+ *   The entity type.
+ * @param $entity_id
+ *   Optional; The entity ID the entity-reference field is attached to.
+ *   Defaults to ''.
+ * @param $string
+ *   The label of the entity to query by.
+ */
+function _drudesk_entityreference_autocomplete_callback_get_matches($type, $field, $instance, $entity_type, $entity_id = '', $string = '') {
+  $matches = array();
+
+  $entity = NULL;
+  if ($entity_id !== 'NULL') {
+    $entity = entity_load_single($entity_type, $entity_id);
+    $has_view_access = (entity_access('view', $entity_type, $entity) !== FALSE);
+    $has_update_access = (entity_access('update', $entity_type, $entity) !== FALSE);
+    if (!$entity || !($has_view_access || $has_update_access)) {
+      return MENU_ACCESS_DENIED;
+    }
+  }
+
+  $handler = entityreference_get_selection_handler($field, $instance, $entity_type, $entity);
+
+  // The user enters a comma-separated list of tags. We only autocomplete the last tag.
+  $tags_typed = drupal_explode_tags($string);
+  $tag_last = drupal_strtolower(array_pop($tags_typed));
+  if (!empty($tag_last)) {
+    $prefix = count($tags_typed) ? implode(', ', $tags_typed) . ', ' : '';
+  }
+
+  if (isset($tag_last)) {
+    global $user;
+
+    $query = db_select('node', 'n');
+    $query->innerJoin('flagging', 'f', 'n.nid = f.entity_id');
+    $query->fields('n', array('nid', 'title'));
+    $query->condition('f.uid', $user->uid);
+    $query->condition('f.sid', flag_get_sid());
+    $nodes = $query->execute()->fetchAllKeyed();
+
+    foreach ($nodes as $nid => &$title) {
+      $title .= ' (' . $nid . ')';
+    }
+
+    // Get an array of matching entities.
+    $entity_labels = $handler->getReferencableEntities($tag_last, $instance['widget']['settings']['match_operator'], 10);
+
+    // Loop through the products and convert them into autocomplete output.
+    foreach ($entity_labels as $values) {
+      foreach ($values as $entity_id => $label) {
+        $key = "$label ($entity_id)";
+
+        if (!in_array($key, $nodes)) {
+          continue;
+        }
+
+        // Strip things like starting/trailing white spaces, line breaks and tags.
+        $key = preg_replace('/\s\s+/', ' ', str_replace("\n", '', trim(decode_entities(strip_tags($key)))));
+        // Names containing commas or quotes must be wrapped in quotes.
+        if (strpos($key, ',') !== FALSE || strpos($key, '"') !== FALSE) {
+          $key = '"' . str_replace('"', '""', $key) . '"';
+        }
+        $matches[$prefix . $key] = '<div class="reference-autocomplete">' . $label . '</div>';
+      }
+    }
+  }
+
+  drupal_json_output($matches);
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function drudesk_form_crm_core_profile_entry_form_anfrage_alter(&$form, &$form_state, $form_id) {
+  $form_state['build_info']['drudesk_ng_lightbox_validation'] = $form['#validate'];
+  $form['#validate'] = array('_drudesk_ng_lightbox_validate');
+
+  $form['actions']['submit']['#ajax']['callback'] = '_drudesk_ng_lightbox_validate';
+  $form['actions']['submit']['#ajax']['wrapper'] = $form_id;
+
+  if (isset($_POST['ng_lightbox_path'])) {
+    $args = explode('&', parse_url($_POST['ng_lightbox_path'], PHP_URL_QUERY));
+    $prefix = 'destination=';
+
+    foreach ($args as $arg) {
+      if (strpos($arg, $prefix) === 0) {
+        $url = substr($arg, strlen($prefix));
+
+        if ($url[0] == '/') {
+          $url = substr($url, 1);
+        }
+
+        $form_state['destination'] = $url;
+        break;
+      }
+    }
+  }
+}
+
+/**
+ * Validate form in NG LightBox modal window.
+ */
+function _drudesk_ng_lightbox_validate(&$form, &$form_state) {
+  foreach ($form_state['build_info']['drudesk_ng_lightbox_validation'] as $func) {
+    $func($form, $form_state);
+  }
+
+  if ($errors = form_get_errors()) {
+    $selector = '.lightbox__body form';
+    $commands[] = ajax_command_insert($selector, drupal_render($form));
+    $commands[] = ajax_command_prepend($selector, theme('status_messages__ng_lightbox'));
+  }
+  else {
+    foreach ($form['#submit'] as $func) {
+      $func($form, $form_state);
+    }
+
+    module_load_include('inc', 'ctools', 'includes/ajax');
+    $commands[] = ctools_ajax_command_redirect($form_state['destination']);
+  }
+
+  print ajax_render($commands);
+  drupal_exit();
+}
+
+/**
+ * Implements hook_js_alter().
+ */
+function drudesk_js_alter(&$javascripts) {
+  $path = drupal_get_path('module', 'flag') . '/theme/flag.js';
+  if (isset($javascripts[$path])) {
+    $javascripts[$path]['data'] = drupal_get_path('module', 'drudesk') . '/flag.js';
+  }
+}
+
+/**
+ * Check exists items in favorites list.
+ */
+function _drudesk_favorites_exists() {
+  global $user;
+  $count = db_select('flagging', 'f')
+    ->fields('f')
+    ->condition('uid', $user->uid)
+    ->condition('sid', flag_get_sid())
+    ->countQuery()
+    ->execute()
+    ->fetchField();
+  return $count > 0;
+}
+
+/**
+ * Page with favorites status.
+ */
+function _drudesk_favorites() {
+  global $user;
+  print drupal_json_encode(array('exists' => _drudesk_favorites_exists()));
+  drupal_exit();
+}
+
+/**
+ * Implements hook_field_widget_form_alter().
+ */
+function drudesk_field_widget_form_alter(&$element, &$form_state, $context) {
+  $ng_lightbox_path = '/anfrage?destination=favorites';
+  $autocomplete_path = 'entityreference/autocomplete/tags/field_angefragte_wohnung/crm_core_activity/anfrage/NULL';
+
+  if (isset($element['#default_value'], $element['#autocomplete_path'], $_POST['ng_lightbox_path']) && strpos($_POST['ng_lightbox_path'], $ng_lightbox_path) === 0 && $element['#autocomplete_path'] == $autocomplete_path) {
+    $element['#autocomplete_path'] = 'dd' . $autocomplete_path;
+  }
+}
